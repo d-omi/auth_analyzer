@@ -29,6 +29,10 @@ import burp.IRequestInfo;
 
 public class RequestModifHelper {
 	
+	// Burp API has a limitation where updateParameter() fails for parameter values longer than ~420 characters
+	// For such cases, we need to manually manipulate the request instead of using the Burp API
+	private static final int BURP_API_MAX_PARAM_LENGTH = 420;
+	
 	public static List<String> getModifiedHeaders(List<String> currentHeaders, Session session) {
 		List<String> headers = currentHeaders;
 		// Check for Parameter Replacement in Path
@@ -277,6 +281,9 @@ public class RequestModifHelper {
 					if (token.isRemove()) {
 						if (parameter.getType() == IParameter.PARAM_JSON) {
 							modifiedRequest = getModifiedJsonRequest(request, originalRequestInfo, token);
+						} else if (parameter.getType() == IParameter.PARAM_COOKIE) {
+							// Use custom cookie handler for removal to avoid any Burp API limitations
+							modifiedRequest = getModifiedCookieRequest(modifiedRequest, originalRequestInfo, token);
 						} else {
 							modifiedRequest = BurpExtender.callbacks.getHelpers().removeParameter(modifiedRequest, parameter);
 						}
@@ -284,6 +291,9 @@ public class RequestModifHelper {
 						tokenPriority.setPriority(tokenPriority.getPriority() + 1);
 						if (parameter.getType() == IParameter.PARAM_JSON) {
 							modifiedRequest = getModifiedJsonRequest(request, originalRequestInfo, token);
+						} else if (parameter.getType() == IParameter.PARAM_COOKIE && token.getValue().length() > BURP_API_MAX_PARAM_LENGTH) {
+							// Use custom cookie handler for values longer than Burp API can handle
+							modifiedRequest = getModifiedCookieRequest(modifiedRequest, originalRequestInfo, token);
 						} else {
 							String parameterValue = token.getValue();
 							IParameter modifiedParameter = BurpExtender.callbacks.getHelpers().buildParameter(parameter.getName(),
@@ -313,6 +323,75 @@ public class RequestModifHelper {
 			modifiedRequest = BurpExtender.callbacks.getHelpers().addParameter(modifiedRequest, newParameter);
 		}
 		return modifiedRequest;
+	}
+	
+	private static byte[] getModifiedCookieRequest(byte[] request, IRequestInfo originalRequestInfo, Token token) {
+		if (!token.isRemove() && token.getValue() == null) {
+			return request;
+		}
+		
+		List<String> headers = originalRequestInfo.getHeaders();
+		boolean cookieFound = false;
+		
+		// Find and modify the Cookie header
+		for (int i = 0; i < headers.size(); i++) {
+			String header = headers.get(i);
+			if (header.startsWith("Cookie:")) {
+				String cookieHeader = header.substring(7).trim(); // Remove "Cookie: " prefix
+				String[] cookies = cookieHeader.split(";");
+				StringBuilder newCookieHeader = new StringBuilder("Cookie: ");
+				boolean first = true;
+				
+				for (String cookie : cookies) {
+					String trimmedCookie = cookie.trim();
+					// Check if this is the cookie we want to modify
+					if (trimmedCookie.startsWith(token.getName() + "=") ||
+							(trimmedCookie.startsWith(token.getUrlEncodedName() + "=")) ||
+							(!token.isCaseSensitiveTokenName() && 
+							 trimmedCookie.toLowerCase().startsWith(token.getName().toLowerCase() + "="))) {
+						cookieFound = true;
+						// Only add if not removing
+						if (!token.isRemove()) {
+							if (!first) {
+								newCookieHeader.append("; ");
+							}
+							newCookieHeader.append(token.getName()).append("=").append(token.getValue());
+							first = false;
+						}
+					} else {
+						// Keep other cookies as-is
+						if (!first) {
+							newCookieHeader.append("; ");
+						}
+						newCookieHeader.append(trimmedCookie);
+						first = false;
+					}
+				}
+				
+				headers.set(i, newCookieHeader.toString());
+				break;
+			}
+		}
+		
+		// If cookie not found and not removing, add it to existing Cookie header or create new one
+		if (!cookieFound && !token.isRemove() && token.isAddIfNotExists()) {
+			boolean cookieHeaderExists = false;
+			for (int i = 0; i < headers.size(); i++) {
+				if (headers.get(i).startsWith("Cookie:")) {
+					headers.set(i, headers.get(i) + "; " + token.getName() + "=" + token.getValue());
+					cookieHeaderExists = true;
+					break;
+				}
+			}
+			// If no Cookie header exists, create one
+			if (!cookieHeaderExists) {
+				headers.add("Cookie: " + token.getName() + "=" + token.getValue());
+			}
+		}
+		
+		// Rebuild the request with modified headers
+		byte[] body = Arrays.copyOfRange(request, originalRequestInfo.getBodyOffset(), request.length);
+		return BurpExtender.callbacks.getHelpers().buildHttpMessage(headers, body);
 	}
 	
 	private static byte[] getModifiedJsonRequest(byte[] request, IRequestInfo originalRequestInfo, Token token) {
