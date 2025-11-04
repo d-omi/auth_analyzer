@@ -28,16 +28,20 @@ import burp.IParameter;
 import burp.IRequestInfo;
 
 public class RequestModifHelper {
-	
+
+	// Burp API has a limitation where updateParameter() fails for parameter values longer than ~420 characters
+	// For such cases, we need to manually manipulate the request instead of using the Burp API
+	private static final int BURP_API_MAX_PARAM_LENGTH = 420;
+
 	public static List<String> getModifiedHeaders(List<String> currentHeaders, Session session) {
 		List<String> headers = currentHeaders;
 		// Check for Parameter Replacement in Path
 		replaceParamInPath(headers, session);
-		
+
 		if(session.isTestCors()) {
 			setOptionsMethod(headers);
 		}
-			
+
 		if(session.isRemoveHeaders()) {
 			String[] headersToRemoveSplit = session.getHeadersToRemove().replace("\r", "").split("\n");
 			Iterator<String> iterator = headers.iterator();
@@ -70,7 +74,7 @@ public class RequestModifHelper {
 		}
 		return headers;
 	}
-	
+
 	private static void replaceParamInPath(List<String> headers, Session session) {
 		int paramIndex = headers.get(0).indexOf("?");
 		String pathHeader;
@@ -131,11 +135,11 @@ public class RequestModifHelper {
 						headers.set(0, pathHeader + appendix);
 					}
 				}
-				
+
 			}
 		}
 	}
-	
+
 	private static void setOptionsMethod(List<String> headers) {
 		int methodIndex = headers.get(0).indexOf(" ");
 		if(methodIndex != -1) {
@@ -143,7 +147,7 @@ public class RequestModifHelper {
 			headers.set(0, header);
 		}
 	}
-	
+
 	private static ArrayList<String> getHeaderToReplaceList(Session session) {
 		HashMap<String, String> headerToReplaceMap = new HashMap<String, String>();
 		String[] headersToReplace = session.getHeadersToReplace().replace("\r", "").split("\n");
@@ -153,7 +157,7 @@ public class RequestModifHelper {
 				headerToReplaceMap.put(headerKeyValuePair[0], headerToReplace);
 			}
 		}
-		
+
 		for (String headerToReplace : headersToReplace) {
 			String[] headerKeyValuePair = headerToReplace.split(":");
 			if (headerKeyValuePair.length > 1) {
@@ -161,7 +165,7 @@ public class RequestModifHelper {
 				for (Token token : session.getTokens()) {
 					if (headerToReplace.contains(token.getHeaderInsertionPointName())) {
 						int startIndex = headerToReplace.indexOf(token.getHeaderInsertionPointName());
-						int endIndex = headerToReplace.indexOf(Globals.INSERTION_POINT_IDENTIFIER, startIndex + Globals.INSERTION_POINT_IDENTIFIER.length()) 
+						int endIndex = headerToReplace.indexOf(Globals.INSERTION_POINT_IDENTIFIER, startIndex + Globals.INSERTION_POINT_IDENTIFIER.length())
 								+ Globals.INSERTION_POINT_IDENTIFIER.length();
 						if (startIndex != -1 && endIndex != -1) {
 							if (token.getValue() != null) {
@@ -183,7 +187,7 @@ public class RequestModifHelper {
 		}
 		return headerToReplaceList;
 	}
-	
+
 	public static byte[] getModifiedRequest(byte[] originalRequest, Session session, TokenPriority tokenPriority) {
 		IRequestInfo originalRequestInfo = BurpExtender.callbacks.getHelpers().analyzeRequest(originalRequest);
 		byte[] modifiedRequest = applyMatchesAndReplaces(session, originalRequest);
@@ -194,7 +198,7 @@ public class RequestModifHelper {
 		}
 		return modifiedRequest;
 	}
-	
+
 	private static byte[] applyMatchesAndReplaces(Session session, byte[] request) {
 		if(session.getMatchAndReplaceList().size() > 0) {
 			try {
@@ -202,7 +206,7 @@ public class RequestModifHelper {
 				for(MatchAndReplace matchAndReplace : session.getMatchAndReplaceList()) {
 					int endIndex = requestAsString.indexOf(matchAndReplace.getMatch());
 					while(endIndex != -1) {
-						requestAsString = requestAsString.substring(0, endIndex) + matchAndReplace.getReplace() 
+						requestAsString = requestAsString.substring(0, endIndex) + matchAndReplace.getReplace()
 						+ requestAsString.substring(endIndex + matchAndReplace.getMatch().length(), requestAsString.length());
 						endIndex = requestAsString.indexOf(matchAndReplace.getMatch(), endIndex);
 					}
@@ -212,10 +216,10 @@ public class RequestModifHelper {
 			catch (Exception e) {
 				BurpExtender.callbacks.printError("Cannot apply match and replaces");
 			}
-		}	
-		return request; 
+		}
+		return request;
 	}
-	
+
 	private static byte[] getModifiedRequest(byte[] request, IRequestInfo originalRequestInfo, Session session, Token token, TokenPriority tokenPriority) {
 		byte[] modifiedRequest = request;
 		boolean tokenExists = false;
@@ -277,6 +281,9 @@ public class RequestModifHelper {
 					if (token.isRemove()) {
 						if (parameter.getType() == IParameter.PARAM_JSON) {
 							modifiedRequest = getModifiedJsonRequest(request, originalRequestInfo, token);
+						} else if (parameter.getType() == IParameter.PARAM_COOKIE) {
+							// Use custom cookie handler for removal to avoid any Burp API limitations
+							modifiedRequest = getModifiedCookieRequest(modifiedRequest, originalRequestInfo, token);
 						} else {
 							modifiedRequest = BurpExtender.callbacks.getHelpers().removeParameter(modifiedRequest, parameter);
 						}
@@ -284,6 +291,9 @@ public class RequestModifHelper {
 						tokenPriority.setPriority(tokenPriority.getPriority() + 1);
 						if (parameter.getType() == IParameter.PARAM_JSON) {
 							modifiedRequest = getModifiedJsonRequest(request, originalRequestInfo, token);
+						} else if (parameter.getType() == IParameter.PARAM_COOKIE && token.getValue().length() > BURP_API_MAX_PARAM_LENGTH) {
+							// Use custom cookie handler for values longer than Burp API can handle
+							modifiedRequest = getModifiedCookieRequest(modifiedRequest, originalRequestInfo, token);
 						} else {
 							String parameterValue = token.getValue();
 							IParameter modifiedParameter = BurpExtender.callbacks.getHelpers().buildParameter(parameter.getName(),
@@ -314,7 +324,76 @@ public class RequestModifHelper {
 		}
 		return modifiedRequest;
 	}
-	
+
+	private static byte[] getModifiedCookieRequest(byte[] request, IRequestInfo originalRequestInfo, Token token) {
+		if (!token.isRemove() && token.getValue() == null) {
+			return request;
+		}
+
+		List<String> headers = originalRequestInfo.getHeaders();
+		boolean cookieFound = false;
+
+		// Find and modify the Cookie header
+		for (int i = 0; i < headers.size(); i++) {
+			String header = headers.get(i);
+			if (header.startsWith("Cookie:")) {
+				String cookieHeader = header.substring(7).trim(); // Remove "Cookie: " prefix
+				String[] cookies = cookieHeader.split(";");
+				StringBuilder newCookieHeader = new StringBuilder("Cookie: ");
+				boolean first = true;
+
+				for (String cookie : cookies) {
+					String trimmedCookie = cookie.trim();
+					// Check if this is the cookie we want to modify
+					if (trimmedCookie.startsWith(token.getName() + "=") ||
+							(trimmedCookie.startsWith(token.getUrlEncodedName() + "=")) ||
+							(!token.isCaseSensitiveTokenName() &&
+							 trimmedCookie.toLowerCase().startsWith(token.getName().toLowerCase() + "="))) {
+						cookieFound = true;
+						// Only add if not removing
+						if (!token.isRemove()) {
+							if (!first) {
+								newCookieHeader.append("; ");
+							}
+							newCookieHeader.append(token.getName()).append("=").append(token.getValue());
+							first = false;
+						}
+					} else {
+						// Keep other cookies as-is
+						if (!first) {
+							newCookieHeader.append("; ");
+						}
+						newCookieHeader.append(trimmedCookie);
+						first = false;
+					}
+				}
+
+				headers.set(i, newCookieHeader.toString());
+				break;
+			}
+		}
+
+		// If cookie not found and not removing, add it to existing Cookie header or create new one
+		if (!cookieFound && !token.isRemove() && token.isAddIfNotExists()) {
+			boolean cookieHeaderExists = false;
+			for (int i = 0; i < headers.size(); i++) {
+				if (headers.get(i).startsWith("Cookie:")) {
+					headers.set(i, headers.get(i) + "; " + token.getName() + "=" + token.getValue());
+					cookieHeaderExists = true;
+					break;
+				}
+			}
+			// If no Cookie header exists, create one
+			if (!cookieHeaderExists) {
+				headers.add("Cookie: " + token.getName() + "=" + token.getValue());
+			}
+		}
+
+		// Rebuild the request with modified headers
+		byte[] body = Arrays.copyOfRange(request, originalRequestInfo.getBodyOffset(), request.length);
+		return BurpExtender.callbacks.getHelpers().buildHttpMessage(headers, body);
+	}
+
 	private static byte[] getModifiedJsonRequest(byte[] request, IRequestInfo originalRequestInfo, Token token) {
 		if (!token.isRemove() && token.getValue() == null) {
 			return request;
@@ -344,7 +423,7 @@ public class RequestModifHelper {
 		byte[] modifiedRequest = BurpExtender.callbacks.getHelpers().buildHttpMessage(headers, jsonBody.getBytes());
 		return modifiedRequest;
 	}
-	
+
 	private static boolean modifyJsonTokenValue(JsonElement jsonElement, Token token) {
 		if (jsonElement.isJsonObject()) {
 			JsonObject jsonObject = jsonElement.getAsJsonObject();
@@ -355,7 +434,7 @@ public class RequestModifHelper {
 					modifyJsonTokenValue(entry.getValue(), token);
 				}
 				if (entry.getValue().isJsonPrimitive()) {
-					if (entry.getKey().equals(token.getName()) || 
+					if (entry.getKey().equals(token.getName()) ||
 							(!token.isCaseSensitiveTokenName() && entry.getKey().toLowerCase().equals(token.getName().toLowerCase()))) {
 						if (token.isRemove()) {
 							jsonObject.remove(entry.getKey());
@@ -376,13 +455,13 @@ public class RequestModifHelper {
 		}
 		return false;
 	}
-	
+
 	private static void addJsonToken(JsonElement jsonElement, Token token) {
 		if (jsonElement.isJsonObject()) {
 			putJsonValue(jsonElement.getAsJsonObject(), token.getName(), token);
 		}
 	}
-	
+
 	private static void putJsonValue(JsonObject jsonObject, String key, Token token) {
 		if(token.getValue().toLowerCase().equals("true") || token.getValue().toLowerCase().equals("false")) {
 			jsonObject.addProperty(key, Boolean.parseBoolean(token.getValue().toLowerCase()));
@@ -397,7 +476,7 @@ public class RequestModifHelper {
 			jsonObject.addProperty(key, token.getValue());
 		}
 	}
-	
+
 	private static boolean isInt(String value) {
 		try {
 			Integer.parseInt(value);
