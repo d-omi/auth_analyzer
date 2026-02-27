@@ -28,6 +28,19 @@ jobs:
       - name: Build with Maven
         run: mvn package -B
 
+      - name: Verify JAR exists
+        run: |
+          echo "Contents of target/:"
+          ls -la target/
+          JAR="target/AuthAnalyzer-${{ inputs.version }}-jar-with-dependencies.jar"
+          if [ ! -f "$JAR" ]; then
+            echo "::error::JAR not found at $JAR"
+            echo "Available JARs:"
+            find target -name "*.jar" -type f
+            exit 1
+          fi
+          echo "Found: $JAR"
+
       - name: Create and push tag
         run: |
           git tag "v${{ inputs.version }}"
